@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Runtime.InteropServices;
 using SpaceMonger.Analysis;
+using SpaceMonger.UI;
 
 namespace SpaceMonger;
 
@@ -47,6 +48,21 @@ public sealed unsafe partial class TreemapView : Control
 
     private nint _memDC, _dib, _oldBitmap, _bits, _hFont;
     private int _w, _h;
+
+    // Zoom animation: a snapshot of the previous frame is stretched between two rectangles.
+    private const int ZoomDurationMs = 230;
+    private nint _snapDC, _snapDib, _snapOldBitmap, _snapBits;
+    private readonly Tween _zoomTween;
+    private double _zoomT = 1;
+    private bool _zoomIn;
+    private Rectangle _zoomRect;
+
+    // Hover hints.
+    private const int HintDelayMs = 1500, HintReshowMs = 250;
+    private readonly ToolTip _tip = new() { UseAnimation = true, UseFading = true };
+    private readonly System.Windows.Forms.Timer _hintTimer = new();
+    private DateTime _lastHintHidden = DateTime.MinValue;
+    private bool _hintVisible;
     private Span<int> Pixels => new((void*)_bits, _w * _h);
 
     private readonly List<Item> _items = new(4096);
@@ -74,7 +90,12 @@ public sealed unsafe partial class TreemapView : Control
 
     public event EventHandler<TreemapHit?>? HoverChanged;
     public event EventHandler<TreemapHit>? ItemActivated;
+    /// <summary>Single left click on an item.</summary>
+    public event EventHandler<TreemapHit>? ItemClicked;
     public event EventHandler<(TreemapHit? hit, int delta)>? WheelZoom;
+
+    /// <summary>Supplies the (title, body) of the hover hint for an item. No provider = no hints.</summary>
+    public Func<TreemapHit, (string title, string body)>? HintProvider { get; set; }
 
     public TreemapView()
     {
@@ -82,6 +103,96 @@ public sealed unsafe partial class TreemapView : Control
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.Opaque |
                  ControlStyles.Selectable, true);
         TabStop = true;
+        _zoomTween = new Tween(ZoomDurationMs, t => { _zoomT = t; Invalidate(); });
+        _hintTimer.Tick += (_, _) => ShowHint();
+    }
+
+    private bool Animating => _zoomTween.Running || _zoomT < 1;
+
+    /// <summary>
+    /// Changes the view root with a zoom animation: zooming in grows the chosen folder out of its
+    /// old rectangle; zooming out shrinks the old view back into its place in the parent.
+    /// Unrelated jumps (and disabled animations) switch instantly.
+    /// </summary>
+    public void ZoomTo(Node target)
+    {
+        var old = _viewRoot;
+        bool zoomIn = old != null && old.IsAncestorOf(target);
+        bool zoomOut = old != null && target.IsAncestorOf(old);
+        if (!Motion.Enabled || _memDC == 0 || _dirty || (!zoomIn && !zoomOut) || !Visible)
+        {
+            ViewRoot = target;
+            return;
+        }
+
+        HideHint();
+        var full = new Rectangle(0, 0, _w, _h);
+        Rectangle? from = zoomIn ? RectOfNearest(target) : null;
+        TakeSnapshot();                        // the old frame
+        _viewRoot = target;
+        Render();                              // the new frame (also rebuilds _items)
+        Rectangle? to = zoomOut ? RectOfNearest(old!) : null;
+
+        _zoomIn = zoomIn;
+        _zoomRect = (zoomIn ? from : to) ?? full;
+        if (_zoomRect.Width < 2 || _zoomRect.Height < 2) _zoomRect = new Rectangle(_zoomRect.X, _zoomRect.Y, 2, 2);
+        _zoomTween.Start();
+    }
+
+    /// <summary>Rectangle of a node in the current layout, or of its nearest drawn ancestor.</summary>
+    private Rectangle? RectOfNearest(Node node)
+    {
+        for (var n = node; n != null; n = n.Parent)
+        {
+            int idx = _items.FindIndex(it => it.Node == n);
+            if (idx >= 0) return _items[idx].Rect;
+        }
+        return null;
+    }
+
+    private void TakeSnapshot()
+    {
+        if (_snapDC == 0)
+        {
+            var bmi = new BITMAPINFOHEADER { biSize = sizeof(BITMAPINFOHEADER), biWidth = _w, biHeight = -_h, biPlanes = 1, biBitCount = 32 };
+            _snapDC = CreateCompatibleDC(0);
+            _snapDib = CreateDIBSection(_snapDC, &bmi, 0, out _snapBits, 0, 0);
+            _snapOldBitmap = SelectObject(_snapDC, _snapDib);
+        }
+        long bytes = (long)_w * _h * 4;
+        Buffer.MemoryCopy((void*)_bits, (void*)_snapBits, bytes, bytes);
+    }
+
+    // ---------------------------------------------------------------- hover hints
+
+    private void RestartHintTimer()
+    {
+        _hintTimer.Stop();
+        if (_hover < 0 || HintProvider == null) return;
+        // Moving between items right after a hint was open shows the next one almost immediately.
+        bool warm = _hintVisible || (DateTime.UtcNow - _lastHintHidden).TotalMilliseconds < 800;
+        _hintTimer.Interval = warm ? HintReshowMs : HintDelayMs;
+        _hintTimer.Start();
+    }
+
+    private void ShowHint()
+    {
+        _hintTimer.Stop();
+        if (HintProvider == null || Animating || Hovered is not { } hit) return;
+        var (title, body) = HintProvider(hit);
+        _tip.ToolTipTitle = title;
+        var p = PointToClient(MousePosition);
+        _tip.Show(body, this, p.X + 16, p.Y + 20, 20000);
+        _hintVisible = true;
+    }
+
+    private void HideHint()
+    {
+        _hintTimer.Stop();
+        if (!_hintVisible) return;
+        _tip.Hide(this);
+        _hintVisible = false;
+        _lastHintHidden = DateTime.UtcNow;
     }
 
     public Node? ViewRoot
@@ -134,15 +245,33 @@ public sealed unsafe partial class TreemapView : Control
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
+        _zoomTween.Stop();
+        _zoomT = 1;
+        HideHint();
         Rebuild();
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        if (_dirty || _memDC == 0) Render();
+        if (_dirty || _memDC == 0) { _zoomTween.Stop(); _zoomT = 1; Render(); }
         var clip = e.ClipRectangle;
         nint hdc = e.Graphics.GetHdc();
-        try { BitBlt(hdc, clip.X, clip.Y, clip.Width, clip.Height, _memDC, clip.X, clip.Y, SRCCOPY); }
+        try
+        {
+            if (_zoomT < 1 && _snapDC != 0)
+            {
+                // Zoom in: new frame grows from the item's old rect over the old frame.
+                // Zoom out: old frame shrinks into its new rect over the new frame.
+                var full = new Rectangle(0, 0, _w, _h);
+                var r = _zoomIn ? Motion.Lerp(_zoomRect, full, _zoomT) : Motion.Lerp(full, _zoomRect, _zoomT);
+                nint baseDC = _zoomIn ? _snapDC : _memDC, topDC = _zoomIn ? _memDC : _snapDC;
+                BitBlt(hdc, 0, 0, _w, _h, baseDC, 0, 0, SRCCOPY);
+                SetStretchBltMode(hdc, COLORONCOLOR);
+                StretchBlt(hdc, r.X, r.Y, Math.Max(1, r.Width), Math.Max(1, r.Height), topDC, 0, 0, _w, _h, SRCCOPY);
+                return; // no outlines mid-animation
+            }
+            BitBlt(hdc, clip.X, clip.Y, clip.Width, clip.Height, _memDC, clip.X, clip.Y, SRCCOPY);
+        }
         finally { e.Graphics.ReleaseHdc(hdc); }
 
         if (_selected != null)
@@ -187,6 +316,13 @@ public sealed unsafe partial class TreemapView : Control
 
     private void FreeBuffer()
     {
+        if (_snapDC != 0)
+        {
+            SelectObject(_snapDC, _snapOldBitmap);
+            DeleteObject(_snapDib);
+            DeleteDC(_snapDC);
+            _snapDC = _snapDib = _snapBits = 0;
+        }
         if (_memDC == 0) return;
         SelectObject(_memDC, _oldBitmap);
         DeleteObject(_dib);
@@ -198,7 +334,13 @@ public sealed unsafe partial class TreemapView : Control
     {
         FreeBuffer();
         if (_hFont != 0) { DeleteObject(_hFont); _hFont = 0; }
-        if (disposing) _labelFont.Dispose();
+        if (disposing)
+        {
+            _labelFont.Dispose();
+            _zoomTween.Dispose();
+            _hintTimer.Dispose();
+            _tip.Dispose();
+        }
         base.Dispose(disposing);
     }
 
@@ -498,6 +640,8 @@ public sealed unsafe partial class TreemapView : Control
         InvalidateItem(_hover);
         _hover = index;
         InvalidateItem(_hover);
+        HideHint();
+        RestartHintTimer();
         HoverChanged?.Invoke(this, Hovered);
     }
 
@@ -516,12 +660,20 @@ public sealed unsafe partial class TreemapView : Control
     {
         base.OnMouseLeave(e);
         SetHover(-1);
+        HideHint();
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
+        HideHint();
         Focus();
+    }
+
+    protected override void OnMouseClick(MouseEventArgs e)
+    {
+        base.OnMouseClick(e);
+        if (e.Button == MouseButtons.Left && !Animating && HitTest(e.Location) is { } hit) ItemClicked?.Invoke(this, hit);
     }
 
     protected override void OnMouseDoubleClick(MouseEventArgs e)
@@ -533,12 +685,14 @@ public sealed unsafe partial class TreemapView : Control
     protected override void OnMouseWheel(MouseEventArgs e)
     {
         base.OnMouseWheel(e);
+        HideHint();
         WheelZoom?.Invoke(this, (HitTest(e.Location), e.Delta));
     }
 
     // ---------------------------------------------------------------- GDI interop
 
     private const uint SRCCOPY = 0x00CC0020;
+    private const int COLORONCOLOR = 3;
     private const int TRANSPARENT = 1;
     private const uint DT_LEFT = 0, DT_CENTER = 1, DT_VCENTER = 4, DT_SINGLELINE = 0x20, DT_NOPREFIX = 0x800, DT_END_ELLIPSIS = 0x8000;
 
@@ -561,5 +715,7 @@ public sealed unsafe partial class TreemapView : Control
     [LibraryImport("gdi32.dll")] private static partial int SetBkMode(nint hdc, int mode);
     [LibraryImport("gdi32.dll")] private static partial int SetTextColor(nint hdc, int color);
     [LibraryImport("gdi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static partial bool BitBlt(nint dest, int x, int y, int w, int h, nint src, int sx, int sy, uint rop);
+    [LibraryImport("gdi32.dll")] private static partial int SetStretchBltMode(nint hdc, int mode);
+    [LibraryImport("gdi32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static partial bool StretchBlt(nint dest, int x, int y, int w, int h, nint src, int sx, int sy, int sw, int sh, uint rop);
     [LibraryImport("user32.dll")] private static partial int DrawTextW(nint hdc, char* text, int count, RECT* rect, uint format);
 }

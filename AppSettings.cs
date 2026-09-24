@@ -11,6 +11,9 @@ public sealed class AppSettings
     public string? LastPath { get; set; }
     public ColorMode ColorMode { get; set; } = ColorMode.Depth;
     public bool ShowInsights { get; set; } = true;
+    public bool Animations { get; set; } = true;
+    public bool ShowTree { get; set; } = true;
+    public int TreeWidth { get; set; } = 340;
     public int InsightsWidth { get; set; } = 520;
 
     private static string FilePath =>

@@ -21,11 +21,19 @@ public partial class Form1 : Form
     private readonly ToolStripStatusLabel _hoverLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
     private readonly ToolStripStatusLabel _statusLabel = new();
     private readonly ToolStripProgressBar _progressBar = new() { Visible = false, Width = 160 };
+    private readonly ToolStripStatusLabel _credit = new($"\u2665 vibe-coded by @{SettingsForm.Author}")
+    {
+        IsLink = true, LinkBehavior = LinkBehavior.HoverUnderline, ToolTipText = SettingsForm.RepoUrl, Margin = new Padding(12, 3, 4, 2),
+    };
     private readonly ContextMenuStrip _menu = new();
     private readonly System.Windows.Forms.Timer _uiTimer = new() { Interval = 250 };
     private readonly ToolStripComboBox _colorBox = new() { DropDownStyle = ComboBoxStyle.DropDownList, AutoSize = false, Width = 90, ToolTipText = "Map colouring" };
     private readonly ToolStripButton _insightsButton = new("Insights") { CheckOnClick = true, ToolTipText = "Show/hide the insights panel" };
     private readonly SplitContainer _split = new() { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel2 };
+    private readonly SplitContainer _outer = new() { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1 };
+    private readonly FolderTree _tree = new() { Dock = DockStyle.Fill };
+    private readonly ContextMenuStrip _treeMenu = new();
+    private readonly ToolStripButton _treeButton = new("Tree") { CheckOnClick = true, ToolTipText = "Show/hide the folder tree" };
     private readonly InsightsPanel _insights = new(LabelStore.Load()) { Dock = DockStyle.Fill };
 
     private Node? _scanRoot;
@@ -79,24 +87,52 @@ public partial class Form1 : Form
             _settings.Save();
         };
 
+        _treeButton.Checked = _settings.ShowTree;
+        _treeButton.Alignment = ToolStripItemAlignment.Right;
+        _treeButton.CheckedChanged += (_, _) =>
+        {
+            _outer.Panel1Collapsed = !(_settings.ShowTree = _treeButton.Checked);
+            _settings.Save();
+        };
+
         var toolbar = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(4, 2, 4, 2) };
         toolbar.Items.AddRange([_pathBox, browse, _scanButton, _stopButton, new ToolStripSeparator(), _upButton, _topButton,
-            new ToolStripSeparator(), new ToolStripLabel("Colour:"), _colorBox, settings, _insightsButton]);
+            new ToolStripSeparator(), new ToolStripLabel("Colour:"), _colorBox, settings, _insightsButton, _treeButton]);
 
         var status = new StatusStrip();
-        status.Items.AddRange([_hoverLabel, _statusLabel, _progressBar]);
+        status.Items.AddRange([_hoverLabel, _statusLabel, _progressBar, _credit]);
+        status.ShowItemToolTips = true;
+        _credit.Click += (_, _) => Process.Start(new ProcessStartInfo(SettingsForm.RepoUrl) { UseShellExecute = true });
 
         _map.ShowFiles = _settings.ShowFiles;
         _map.ColorMode = _settings.ColorMode;
+        _map.HintProvider = Hint;
+        Motion.Enabled = _settings.Animations;
         _map.HoverChanged += (_, hit) => _hoverLabel.Text = Describe(hit);
         _map.ItemActivated += (_, hit) => { if (hit.Node is { IsDirectory: true } d) ZoomTo(d); };
+        _map.ItemClicked += (_, hit) => Select(hit.Node ?? hit.Owner, revealInTree: true);
+
+        // EnsureVisible may zoom the map out (which reveals the new view root in the tree), so re-select n.
+        _tree.NodeSelected += n => { EnsureVisible(n); Select(n, revealInTree: true); };
+        _tree.NodeActivated += n =>
+        {
+            if (n.IsDirectory) ZoomTo(n);
+            else { EnsureVisible(n); Select(n, revealInTree: true); }
+        };
+        _tree.ContextMenuStrip = _treeMenu;
+        _treeMenu.Opening += (_, e) =>
+        {
+            _treeMenu.Items.Clear();
+            if (_tree.SelectedModelNode is { } n) FillMenu(_treeMenu, n, deletable: true);
+            else e.Cancel = true;
+        };
         _map.WheelZoom += (_, a) => { if (a.delta > 0) ZoomToward(a.hit); else ZoomOut(); };
         _map.ContextMenuStrip = _menu;
         _menu.Opening += MenuOpening;
 
         _uiTimer.Tick += (_, _) => OnUiTick();
 
-        _insights.NodeSelected += n => { EnsureVisible(n); _map.Selected = n; };
+        _insights.NodeSelected += n => { EnsureVisible(n); Select(n, revealInTree: true); };
         _insights.NodeActivated += n => { ZoomTo(n.IsDirectory ? n : n.Parent ?? n); _map.Selected = n; };
         _insights.DeleteRequested += DeleteNodes;
 
@@ -106,8 +142,13 @@ public partial class Form1 : Form
         _split.SplitterMoved += (_, _) => { if (_shown) _settings.InsightsWidth = _split.Panel2.Width; };
         FormClosed += (_, _) => _settings.Save();
 
+        _outer.Panel1.Controls.Add(_tree);
+        _outer.Panel2.Controls.Add(_split);
+        _outer.Panel1Collapsed = !_settings.ShowTree;
+        _outer.SplitterMoved += (_, _) => { if (_shown) _settings.TreeWidth = _outer.Panel1.Width; };
+
         // Dock order: last added docks first.
-        Controls.Add(_split);
+        Controls.Add(_outer);
         Controls.Add(_crumbs);
         Controls.Add(toolbar);
         Controls.Add(status);
@@ -118,6 +159,8 @@ public partial class Form1 : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        _outer.Panel1MinSize = 200;
+        _outer.SplitterDistance = Math.Clamp(_settings.TreeWidth, 200, Math.Max(200, _outer.Width / 2));
         _split.Panel2MinSize = 340;
         _split.SplitterDistance = Math.Max(300, _split.Width - Math.Max(420, _settings.InsightsWidth));
         _shown = true;
@@ -173,6 +216,7 @@ public partial class Form1 : Form
 
         _insights.Reset();
         _map.Selected = null;
+        _tree.SetRoot(null);
         _stopwatch = Stopwatch.StartNew();
         _progressBar.Visible = true;
         _progressBar.Style = engine == ScanEngine.NtfsMft ? ProgressBarStyle.Continuous : ProgressBarStyle.Marquee;
@@ -250,6 +294,7 @@ public partial class Form1 : Form
         if (_liveScan)
         {
             _map.Rebuild();
+            _tree.Invalidate();
             UpdateCrumbs();
         }
     }
@@ -259,6 +304,7 @@ public partial class Form1 : Form
         _scanRoot = root;
         _map.ChildrenSorted = sorted;
         _map.ViewRoot = root;
+        _tree.SetRoot(root);
         UpdateCrumbs();
         UpdateButtons();
     }
@@ -279,6 +325,7 @@ public partial class Form1 : Form
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
         _map.ShowFiles = _settings.ShowFiles;
         _map.ColorMode = _settings.ColorMode;
+        Motion.Enabled = _settings.Animations;
         if (dlg.RestartAsAdminRequested) RestartElevated();
     }
 
@@ -303,10 +350,19 @@ public partial class Form1 : Form
 
     private void ZoomTo(Node node)
     {
-        _map.ViewRoot = node;
+        _map.ZoomTo(node);
+        _map.Selected = null;
+        _tree.Reveal(node);
         UpdateCrumbs();
         UpdateButtons();
         if (!IsScanning) _insights.SetView(node);
+    }
+
+    /// <summary>Highlights a node in the map (not the whole view) and optionally in the tree.</summary>
+    private void Select(Node n, bool revealInTree)
+    {
+        _map.Selected = n == _map.ViewRoot ? null : n;
+        if (revealInTree) _tree.Reveal(n);
     }
 
     /// <summary>Zooms out to the folder containing <paramref name="n"/> if it's outside the current view.</summary>
@@ -363,6 +419,62 @@ public partial class Form1 : Form
         _topButton.Enabled = _map.ViewRoot != null && _map.ViewRoot != _scanRoot;
     }
 
+    /// <summary>Title and body of the hover hint shown after resting on an item.</summary>
+    private (string title, string body) Hint(TreemapHit h)
+    {
+        long viewSize = Math.Max(1, _map.ViewRoot?.Size ?? 1);
+        if (h.IsFileGroup)
+        {
+            return ($"{h.FileGroupCount:N0} files",
+                $"{Fmt.Size(h.Size)} of files directly in\n{h.Owner.FullPath}\n\n" +
+                "Shown as one block because \u201cShow individual files\u201d is off in Settings.");
+        }
+
+        var n = h.Node!;
+        var sb = new System.Text.StringBuilder();
+        if (n.Parent != null) sb.AppendLine(n.Parent.FullPath);
+        long parentSize = n.Parent?.Size ?? 0;
+        sb.Append(Fmt.Size(h.Size));
+        if (parentSize > 0) sb.Append($"  \u00b7  {Pct(h.Size, parentSize)} of parent");
+        if (n != _map.ViewRoot) sb.Append($"  \u00b7  {Pct(h.Size, viewSize)} of view");
+        sb.AppendLine();
+
+        if (n.IsDirectory)
+        {
+            int subdirs = n.Children?.Count(c => c.IsDirectory) ?? 0;
+            int files = n.Children?.Length - subdirs ?? 0;
+            sb.AppendLine($"{n.FileCount:N0} files in total  \u00b7  {subdirs:N0} folders and {files:N0} files directly inside");
+            if (n.LastWrite > 0) sb.AppendLine($"Newest file: {n.LastWriteUtc.ToLocalTime():yyyy-MM-dd} ({Ago(n.LastWriteUtc)})");
+            sb.AppendLine();
+            sb.Append("Double-click to zoom in \u00b7 right-click for actions");
+        }
+        else
+        {
+            var cat = FileCategories.Of(n.Name);
+            sb.AppendLine($"Type: {cat} ({FileCategories.Extension(n.Name)})");
+            if (n.LastWrite > 0) sb.AppendLine($"Modified: {n.LastWriteUtc.ToLocalTime():yyyy-MM-dd HH:mm} ({Ago(n.LastWriteUtc)})");
+            sb.AppendLine();
+            sb.Append("Right-click to open, reveal or delete");
+        }
+        return (n.Name, sb.ToString());
+    }
+
+    private static string Pct(long part, long whole)
+    {
+        double p = 100.0 * part / whole;
+        return p is > 0 and < 0.1 ? "<0.1%" : $"{p:0.#}%";
+    }
+
+    private static string Ago(DateTime utc)
+    {
+        var span = DateTime.UtcNow - utc;
+        if (span.TotalDays < 1) return "today";
+        if (span.TotalDays < 2) return "yesterday";
+        if (span.TotalDays < 60) return $"{(int)span.TotalDays} days ago";
+        if (span.TotalDays < 730) return $"{(int)(span.TotalDays / 30.4)} months ago";
+        return $"{span.TotalDays / 365.25:0.#} years ago";
+    }
+
     private string Describe(TreemapHit? hit)
     {
         if (hit is not { } h) return "";
@@ -382,8 +494,12 @@ public partial class Form1 : Form
         _menu.Items.Clear();
         _menuHit = _map.HitTest(_map.PointToClient(Cursor.Position));
         if (_menuHit is not { } hit) { e.Cancel = true; return; }
+        FillMenu(_menu, hit.Node ?? hit.Owner, deletable: hit.Node != null);
+    }
 
-        Node target = hit.Node ?? hit.Owner;
+    /// <summary>Shared right-click menu for the map and the tree.</summary>
+    private void FillMenu(ContextMenuStrip menu, Node target, bool deletable)
+    {
         string path = target.FullPath;
         bool isDir = target.IsDirectory;
 
@@ -394,10 +510,10 @@ public partial class Form1 : Form
         var copy = new ToolStripMenuItem("Copy path", null, (_, _) => Clipboard.SetText(path));
         var delete = new ToolStripMenuItem("Delete to Recycle Bin\u2026", null, (_, _) => DeleteNodes([target]))
         {
-            Enabled = !IsScanning && hit.Node != null && target.Parent != null,
+            Enabled = !IsScanning && deletable && target.Parent != null,
             ForeColor = Color.Firebrick,
         };
-        _menu.Items.AddRange([zoomIn, zoomOut, new ToolStripSeparator(), open, reveal, copy, new ToolStripSeparator(), delete]);
+        menu.Items.AddRange([zoomIn, zoomOut, new ToolStripSeparator(), open, reveal, copy, new ToolStripSeparator(), delete]);
     }
 
     private void Shell(string path)
@@ -451,6 +567,7 @@ public partial class Form1 : Form
             if (view == node || (view != null && node.IsAncestorOf(view))) ZoomTo(parent);
             if (_map.Selected is { } sel && (sel == node || node.IsAncestorOf(sel))) _map.Selected = null;
             _insights.OnNodeRemoved(node);
+            _tree.OnNodeRemoved(node);
             deleted++;
         }
         _map.Rebuild();

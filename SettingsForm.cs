@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using SpaceMonger.Scanning;
 
 namespace SpaceMonger;
@@ -8,6 +9,10 @@ public sealed class SettingsForm : Form
     private readonly RadioButton _mft = new() { Text = "NTFS MFT direct read (fastest; admin + NTFS only)", AutoSize = true };
     private readonly CheckBox _showFiles = new() { Text = "Show individual files in the map", AutoSize = true };
     private readonly CheckBox _live = new() { Text = "Update the map live while scanning", AutoSize = true };
+    private readonly CheckBox _animations = new() { Text = "Animations (zoom, charts)", AutoSize = true };
+
+    public const string Author = "marlon07021";
+    public const string RepoUrl = "https://github.com/marlon07021/spacemonger";
 
     /// <summary>Set when the user asks to relaunch elevated.</summary>
     public bool RestartAsAdminRequested { get; private set; }
@@ -27,6 +32,7 @@ public sealed class SettingsForm : Form
         _mft.Checked = s.Engine == ScanEngine.NtfsMft;
         _showFiles.Checked = s.ShowFiles;
         _live.Checked = s.LiveUpdate;
+        _animations.Checked = s.Animations;
 
         var engineBox = new GroupBox { Text = "Scan engine", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Fill, Padding = new Padding(8) };
         var engineFlow = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, Dock = DockStyle.Fill, WrapContents = false };
@@ -56,7 +62,19 @@ public sealed class SettingsForm : Form
         var viewFlow = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, Dock = DockStyle.Fill, WrapContents = false };
         viewFlow.Controls.Add(_showFiles);
         viewFlow.Controls.Add(_live);
+        viewFlow.Controls.Add(_animations);
         viewBox.Controls.Add(viewFlow);
+
+        var aboutBox = new GroupBox { Text = "About", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Fill, Padding = new Padding(8) };
+        var aboutFlow = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, Dock = DockStyle.Fill, WrapContents = false };
+        var version = typeof(SettingsForm).Assembly.GetName().Version;
+        aboutFlow.Controls.Add(new Label { Text = $"SpaceMonger {version?.ToString(3)}", AutoSize = true, Font = new Font(Font, FontStyle.Bold) });
+        aboutFlow.Controls.Add(new Label { Text = $"Vibe-coded with \u2665 by @{Author}", AutoSize = true });
+        var link = new LinkLabel { Text = RepoUrl, AutoSize = true };
+        link.LinkClicked += (_, _) => Process.Start(new ProcessStartInfo(RepoUrl) { UseShellExecute = true });
+        aboutFlow.Controls.Add(link);
+        aboutFlow.Controls.Add(new Label { Text = "MIT licensed.", AutoSize = true, ForeColor = SystemColors.GrayText });
+        aboutBox.Controls.Add(aboutFlow);
 
         var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, AutoSize = true };
         var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true };
@@ -70,6 +88,7 @@ public sealed class SettingsForm : Form
         var layout = new TableLayoutPanel { AutoSize = true, ColumnCount = 1, Dock = DockStyle.Fill };
         layout.Controls.Add(engineBox);
         layout.Controls.Add(viewBox);
+        layout.Controls.Add(aboutBox);
         layout.Controls.Add(buttons);
         Controls.Add(layout);
     }
@@ -79,6 +98,7 @@ public sealed class SettingsForm : Form
         s.Engine = _mft.Checked ? ScanEngine.NtfsMft : ScanEngine.Win32Parallel;
         s.ShowFiles = _showFiles.Checked;
         s.LiveUpdate = _live.Checked;
+        s.Animations = _animations.Checked;
         s.Save();
     }
 }
