@@ -45,6 +45,22 @@ trade-offs and noticing what's wrong are also engineering. The author remains un
 - **Right-click menu.** Open, Show in Explorer, Copy path, and Delete to Recycle Bin (always asks first).
 - **Live updates.** The map fills in while the scan is running.
 
+### Folder tree and search
+- **Folder tree.** Explorer-style, largest items first, with a bar showing each item's share of its parent. It stays in sync with the map both ways.
+- **Global search** (Ctrl+F). Unlocks once the scan finishes and the search index is built (≈0.85 s for 5.6M items). Typical queries take 10–60 ms. Results are listed largest first, and you can limit them to the current view.
+
+  | Query | Finds |
+  |---|---|
+  | `report 2024` | names containing both words |
+  | `*.mp4`, `IMG_????.jpg` | wildcards |
+  | `ext:iso,vhdx` | by extension |
+  | `type:video` | by category (video, audio, image, document, archive, code, …) |
+  | `size:>1gb`, `size:<10k` | by size |
+  | `age:>2y`, `age:<7d` | by last-modified age |
+  | `is:folder`, `is:file` | by kind |
+
+  Combine them freely: `type:video size:>500mb age:>1y`.
+
 ### Two scan engines (switch in Settings)
 | Engine | Needs | Notes |
 |---|---|---|

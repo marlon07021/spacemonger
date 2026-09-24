@@ -34,6 +34,15 @@ public partial class Form1 : Form
     private readonly FolderTree _tree = new() { Dock = DockStyle.Fill };
     private readonly ContextMenuStrip _treeMenu = new();
     private readonly ToolStripButton _treeButton = new("Tree") { CheckOnClick = true, ToolTipText = "Show/hide the folder tree" };
+    private readonly ToolStripTextBox _searchBox = new() { AutoSize = false, Width = 260, Enabled = false,
+        ToolTipText = "Search (Ctrl+F)\nwords · *.mp4 · ext:iso,zip · type:video · size:>1gb · age:>2y · is:folder" };
+    private readonly SearchPanel _searchPanel = new() { Dock = DockStyle.Fill, Visible = false };
+    private readonly ContextMenuStrip _searchMenu = new();
+    private readonly System.Windows.Forms.Timer _searchDebounce = new() { Interval = 180 };
+    private SearchIndex? _index;
+    private CancellationTokenSource? _searchCts;
+    private const int MaxSearchResults = 2000;
+    private bool _navigatingFromSearch; // result clicks may zoom; don't re-run a view-scoped search then
     private readonly InsightsPanel _insights = new(LabelStore.Load()) { Dock = DockStyle.Fill };
 
     private Node? _scanRoot;
@@ -97,7 +106,16 @@ public partial class Form1 : Form
 
         var toolbar = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(4, 2, 4, 2) };
         toolbar.Items.AddRange([_pathBox, browse, _scanButton, _stopButton, new ToolStripSeparator(), _upButton, _topButton,
-            new ToolStripSeparator(), new ToolStripLabel("Colour:"), _colorBox, settings, _insightsButton, _treeButton]);
+            new ToolStripSeparator(), new ToolStripLabel("Colour:"), _colorBox, new ToolStripSeparator(), _searchBox, settings, _insightsButton, _treeButton]);
+        _searchBox.TextBox.PlaceholderText = "Search \u2014 available after a scan";
+        _searchBox.TextChanged += (_, _) => { _searchDebounce.Stop(); _searchDebounce.Start(); };
+        _searchBox.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; _searchBox.Clear(); _map.Focus(); }
+            else if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; _searchDebounce.Stop(); RunSearch(); }
+            else if (e.KeyCode == Keys.Down) { e.SuppressKeyPress = true; _searchPanel.FocusResults(); }
+        };
+        _searchDebounce.Tick += (_, _) => { _searchDebounce.Stop(); RunSearch(); };
 
         var status = new StatusStrip();
         status.Items.AddRange([_hoverLabel, _statusLabel, _progressBar, _credit]);
@@ -142,7 +160,23 @@ public partial class Form1 : Form
         _split.SplitterMoved += (_, _) => { if (_shown) _settings.InsightsWidth = _split.Panel2.Width; };
         FormClosed += (_, _) => _settings.Save();
 
+        _searchPanel.NodeSelected += n => FromSearch(() => { EnsureVisible(n); Select(n, revealInTree: true); });
+        _searchPanel.NodeActivated += n => FromSearch(() =>
+        {
+            if (n.IsDirectory) ZoomTo(n);
+            else { EnsureVisible(n); Select(n, revealInTree: true); }
+        });
+        _searchPanel.ScopeChanged += RunSearch;
+        _searchPanel.ResultMenu = _searchMenu;
+        _searchMenu.Opening += (_, e) =>
+        {
+            _searchMenu.Items.Clear();
+            if (_searchPanel.SelectedResult is { } n) FillMenu(_searchMenu, n, deletable: true);
+            else e.Cancel = true;
+        };
+
         _outer.Panel1.Controls.Add(_tree);
+        _outer.Panel1.Controls.Add(_searchPanel);
         _outer.Panel2.Controls.Add(_split);
         _outer.Panel1Collapsed = !_settings.ShowTree;
         _outer.SplitterMoved += (_, _) => { if (_shown) _settings.TreeWidth = _outer.Panel1.Width; };
@@ -175,7 +209,13 @@ public partial class Form1 : Form
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
-        if (!_pathBox.Focused)
+        if (keyData == (Keys.Control | Keys.F) && _searchBox.Enabled)
+        {
+            _searchBox.Focus();
+            _searchBox.SelectAll();
+            return true;
+        }
+        if (!_pathBox.Focused && !_searchBox.Focused)
         {
             switch (keyData)
             {
@@ -217,6 +257,11 @@ public partial class Form1 : Form
         _insights.Reset();
         _map.Selected = null;
         _tree.SetRoot(null);
+        _searchCts?.Cancel();
+        _index = null;
+        _searchBox.Enabled = false;
+        _searchBox.TextBox.PlaceholderText = "Search \u2014 available after the scan";
+        if (_searchBox.Text.Length > 0) _searchPanel.ShowMessage("Scanning\u2026 search resumes when the index is ready");
         _stopwatch = Stopwatch.StartNew();
         _progressBar.Visible = true;
         _progressBar.Style = engine == ScanEngine.NtfsMft ? ProgressBarStyle.Continuous : ProgressBarStyle.Marquee;
@@ -255,6 +300,7 @@ public partial class Form1 : Form
             await Task.Run(() => Node.FinalizeTree(root!));
             SetScanRoot(root!, sorted: true);
             _insights.SetScan(root!, complete: !cts.IsCancellationRequested);
+            _ = BuildSearchIndexAsync(root!);
 
             _stopwatch.Stop();
             string engineName = engine == ScanEngine.NtfsMft ? "MFT" : "Win32";
@@ -356,6 +402,68 @@ public partial class Form1 : Form
         UpdateCrumbs();
         UpdateButtons();
         if (!IsScanning) _insights.SetView(node);
+        if (_searchPanel.Visible && _searchPanel.ScopeToView && !_navigatingFromSearch) RunSearch();
+    }
+
+    // ---------------------------------------------------------------- search
+
+    /// <summary>Builds the flat search index in the background; the search box unlocks when it's ready.</summary>
+    private async Task BuildSearchIndexAsync(Node root, bool rerun = true)
+    {
+        _searchBox.TextBox.PlaceholderText = "Indexing files for search\u2026";
+        try
+        {
+            var index = await Task.Run(() => SearchIndex.Build(root));
+            if (root != _scanRoot || IsScanning) return;
+            _index = index;
+            _searchBox.Enabled = true;
+            _searchBox.TextBox.PlaceholderText = $"Search {index.Count:N0} items (Ctrl+F)";
+            if (rerun && _searchBox.Text.Length > 0) RunSearch();
+        }
+        catch (Exception ex)
+        {
+            _searchBox.TextBox.PlaceholderText = "Search unavailable: " + ex.Message;
+        }
+    }
+
+    private void FromSearch(Action action)
+    {
+        _navigatingFromSearch = true;
+        try { action(); }
+        finally { _navigatingFromSearch = false; }
+    }
+
+    private async void RunSearch()
+    {
+        string text = _searchBox.Text.Trim();
+        if (text.Length == 0)
+        {
+            _searchCts?.Cancel();
+            _searchPanel.Visible = false;
+            _tree.Visible = true;
+            _outer.Panel1Collapsed = !_settings.ShowTree;
+            return;
+        }
+
+        _searchPanel.Visible = true;
+        _tree.Visible = false;
+        _outer.Panel1Collapsed = false; // results live in the left pane even if the tree is hidden
+
+        var index = _index;
+        if (index == null) { _searchPanel.ShowMessage("Indexing\u2026 results appear when it's ready"); return; }
+        var query = SearchQuery.Parse(text);
+        if (query.Error != null) { _searchPanel.ShowError(query.Error); return; }
+
+        _searchCts?.Cancel();
+        var cts = _searchCts = new CancellationTokenSource();
+        Node scope = _searchPanel.ScopeToView && _map.ViewRoot != null ? _map.ViewRoot : index.Root;
+        try
+        {
+            var result = await Task.Run(() => index.Search(query, scope, MaxSearchResults, cts.Token));
+            if (cts.IsCancellationRequested) return;
+            _searchPanel.ShowResults(result, MaxSearchResults);
+        }
+        catch (OperationCanceledException) { }
     }
 
     /// <summary>Highlights a node in the map (not the whole view) and optionally in the tree.</summary>
@@ -568,10 +676,12 @@ public partial class Form1 : Form
             if (_map.Selected is { } sel && (sel == node || node.IsAncestorOf(sel))) _map.Selected = null;
             _insights.OnNodeRemoved(node);
             _tree.OnNodeRemoved(node);
+            _searchPanel.OnNodeRemoved(node);
             deleted++;
         }
         _map.Rebuild();
         UpdateCrumbs();
         _statusLabel.Text = $"Moved {deleted} item(s) to the Recycle Bin";
+        if (deleted > 0 && _scanRoot != null) _ = BuildSearchIndexAsync(_scanRoot, rerun: false);
     }
 }
