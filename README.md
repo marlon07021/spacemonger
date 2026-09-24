@@ -6,6 +6,13 @@ can safely delete.
 
 Built with .NET 8 and WinForms. No admin rights needed, no telemetry, and nothing leaves your machine.
 
+## Download
+
+Get the latest build from **[Releases](https://github.com/marlon07021/spacemonger/releases/latest)**. Unzip `SpaceMonger-vX-win-x64.zip` and run `SpaceMonger.exe`; nothing to install.
+A new release is built automatically by GitHub Actions on every push to `main`.
+
+> The exe isn't code-signed, so Windows SmartScreen may warn you the first time: click *More info → Run anyway*.
+
 ---
 
 ## A confession from the "author"

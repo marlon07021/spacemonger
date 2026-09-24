@@ -1,0 +1,77 @@
+# Builds SpaceMonger on every push to main and publishes a GitHub Release with two downloads:
+#   - SpaceMonger-vX-win-x64.zip                      single self-contained exe (no .NET install needed)
+#   - SpaceMonger-vX-win-x64-framework-dependent.zip  small exe, needs the .NET 8 Desktop Runtime
+# Free: GitHub Actions minutes are unlimited for public repositories.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore']   # docs-only pushes don't cut a release
+  workflow_dispatch:                                  # "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write   # needed to create tags and releases
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Compute version
+        id: version
+        shell: pwsh
+        run: echo "version=1.0.${{ github.run_number }}" >> $env:GITHUB_OUTPUT
+
+      - name: Publish (self-contained single file)
+        run: >
+          dotnet publish SpaceMonger.csproj -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true -p:DebugType=none
+          -p:Version=${{ steps.version.outputs.version }}
+          -o out/self-contained
+
+      - name: Publish (framework-dependent single file)
+        run: >
+          dotnet publish SpaceMonger.csproj -c Release -r win-x64 --self-contained false
+          -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=none
+          -p:Version=${{ steps.version.outputs.version }}
+          -o out/framework-dependent
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          Copy-Item README.md, LICENSE out/self-contained/
+          Copy-Item README.md, LICENSE out/framework-dependent/
+          Compress-Archive -Path out/self-contained/* -DestinationPath "SpaceMonger-v$v-win-x64.zip"
+          Compress-Archive -Path out/framework-dependent/* -DestinationPath "SpaceMonger-v$v-win-x64-framework-dependent.zip"
+          Get-ChildItem *.zip | Format-Table Name, Length
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          $notes = @"
+          **Download:** ``SpaceMonger-v$v-win-x64.zip`` - unzip and run ``SpaceMonger.exe`` (no install needed).
+          The ``framework-dependent`` zip is much smaller but needs the [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0).
+
+          Windows may show a SmartScreen warning because the exe isn't code-signed: choose *More info -> Run anyway*.
+          "@
+          gh release create "v$v" (Get-ChildItem *.zip).FullName `
+            --target "${{ github.sha }}" `
+            --title "SpaceMonger v$v" `
+            --notes "$notes" `
+            --generate-notes `
+            --latest
